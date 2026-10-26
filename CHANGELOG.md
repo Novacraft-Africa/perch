@@ -1,5 +1,24 @@
 # Changelog
 
+## 2.11.0
+
+### Added — `perch services`
+- **`perch services`** lists background LaunchAgents next to your dev servers: status (running / idle / not loaded), schedule (interval, calendar, keepalive) and the last line of its log. `start`, `stop`, `restart` and `log <name> [lines]` act on one by short name.
+- Agents are discovered from `~/Library/LaunchAgents` by label prefix (`PERCH_SERVICE_PREFIXES`), so a new one shows up without editing perch.
+
+### Added — full-display app pins
+- **`perch apps add "App" <d:s> full`** sizes the pinned app to fill its display on every place, without native fullscreen, so it keeps the menu bar and stays switchable. `perch apps list` shows the size.
+
+### Fixed — native-fullscreen apps no longer loop
+- Placement now **skips native-fullscreen windows**. Moving one makes macOS report a space change, which re-fired autoplace, which moved it again: a loop that stole focus and the pointer every few seconds.
+
+### Changed — simulators and emulators are opt-in
+- **Devices are only arranged when `spaces.conf` has a `devices|<d:s>` line.** Without one, perch leaves every simulator and emulator window exactly where you put it; it used to fall back to the `other` desktop.
+- When `devices` is set: iOS simulators take the bottom row first, an emulator's toolbar moves with its emulator, every window sits on the row's bottom edge, a slight overflow overlaps neighbours instead of wrapping, and perch never resizes a device window.
+
+### Changed — `perch autoplace`
+- Bare **`perch autoplace` arranges now, then shows status**, instead of only printing status.
+
 ## 2.10.0
 
 ### Added — `perch tidy`

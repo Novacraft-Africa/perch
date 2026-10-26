@@ -24,7 +24,8 @@ perch started life as **`pz-dev`** — a throwaway shell helper for one project,
 - Servers outlive the shell that launched them. They run in real Terminal tabs, not child processes.
 - **Favorites**: pick a working set once, launch it all with `perch fav go`, stop it with `perch killall`.
 - **Desktop placement (optional)**: send each server to a specific desktop by category, tiled full width and stacked, across any monitor layout. Off cleanly if you don't want it.
-- **Pin other apps too**: `perch apps add "Google Chrome" 2:1` sends any app's windows to a chosen display/desktop, not just terminals.
+- **Pin other apps too**: `perch apps add "Google Chrome" 2:1` sends any app's windows to a chosen display/desktop, not just terminals. Add `full` to size it to fill that display; native-fullscreen windows are left alone.
+- **Background services**: `perch services` lists your LaunchAgents (watchdogs, sync jobs, local daemons) with status, schedule and last log line; `start`, `stop`, `restart` and `log` manage one by name.
 - **Park on monitor unplug**: when an external display disconnects, perch minimizes the windows macOS dumps onto the laptop and restores them on reconnect — the laptop screen stays yours. Toggle with `perch set park`, or exempt a single app with `perch apps park "<App>" off` (also a per-app switch in the menu bar) so that one stays in place.
 - **Herd your coding agents**: run Claude Code / Codex / Cursor / opencode / aider as persistent, resumable sessions; see which one is **working / blocked / idle** at a glance; attach the whole herd as tabs in one terminal. See below.
 - **Android emulators, perched**: `perch emu <avd>` runs each AVD in its own tab with pinned DNS, so a VPN/Wi-Fi change can't leave it unable to resolve any host; `perch emu adopt` (and `perch reap`) pull emulators started elsewhere into their perch tab.

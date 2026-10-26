@@ -7,7 +7,7 @@
 # Run `perch help` for usage.
 set -euo pipefail
 
-PERCH_VERSION="2.10.0"
+PERCH_VERSION="2.11.0"
 CONFIG="${PERCH_CONFIG:-$HOME/.config/perch/projects.conf}"
 FAVORITES="${PERCH_FAVORITES:-$HOME/.config/perch/favorites}"
 CATEGORIES="${PERCH_CATEGORIES:-$HOME/.config/perch/categories.conf}"
@@ -56,6 +56,7 @@ USAGE
   perch reap [--dry]                     kill servers on a registered port running in NO perch tab (orphans)
   perch bar [open|build|on|off|stop]     menu bar (toolbar) app: start/restart/place projects + live net speed from the menu bar
   perch apps [list|add|remove|capture]   also pin OTHER apps (Chrome, Slack…) to a display:space; place + park cover them
+  perch apps add "App" <d:s> full        ...and size it to fill that display on every place
   perch apps park "<App>" on|off         exempt one app from parking — off = it stays in place when a monitor disconnects
 
   EMULATORS (Android AVDs, each in its own perch tab with pinned DNS)
@@ -85,6 +86,7 @@ USAGE
   perch stop <project|port>              kill whatever holds that project's port
   perch clear                            clear text + scrollback of ALL Terminal tabs (Cmd+K, keeps servers running)
   perch tidy [--dry]                     close every Terminal tab sitting idle; keeps anything still running
+  perch services [start|stop|log] [n]    background LaunchAgents (watchdogs, sync jobs, daemons) + their last log line
   perch killall                          stop every running registered server (by port)
   perch killall --close                  ...and close their Terminal tabs too
   perch killall fav                      stop only the servers in your favorites
@@ -155,7 +157,7 @@ resolve_project() {
   resolve_by_dirbase "$wanted"
 }
 
-COMMANDS="fav pick place set gui setup doctor list groups autoplace stop killall tidy add remove config port bounds start restart help"
+COMMANDS="fav pick place set gui setup doctor list groups autoplace stop killall tidy services add remove config port bounds start restart help"
 
 # Read candidate strings on stdin; print up to 3 closest to $1 by edit distance
 # (deduped, nearest first), keeping only ones within a sane threshold.
@@ -1131,6 +1133,100 @@ OSA
   echo "[perch] tidy: closed ${closed:-0} idle tab(s), kept $busy running"
 }
 
+# Background LaunchAgents (watchdogs, sync jobs, local daemons) alongside the dev
+# servers perch already runs. Discovered from ~/Library/LaunchAgents by label prefix,
+# so a new agent shows up here without editing perch.
+SERVICE_PREFIXES="${PERCH_SERVICE_PREFIXES:-com.jaybee. dev.jaybee.}"
+
+service_plists() {
+  local f lbl pre
+  for f in "$HOME/Library/LaunchAgents"/*.plist; do
+    [ -f "$f" ] || continue
+    lbl="$(/usr/libexec/PlistBuddy -c 'Print :Label' "$f" 2>/dev/null)" || continue
+    [ -n "$lbl" ] || continue
+    for pre in $SERVICE_PREFIXES; do
+      case "$lbl" in "$pre"*) printf '%s|%s\n' "$lbl" "$f"; break ;; esac
+    done
+  done
+}
+
+service_short() { printf '%s' "${1##*.jaybee.}"; }
+
+service_resolve() {
+  local want="$1" lbl path
+  while IFS='|' read -r lbl path; do
+    if [ "$lbl" = "$want" ] || [ "$(service_short "$lbl")" = "$want" ]; then
+      printf '%s|%s\n' "$lbl" "$path"; return 0
+    fi
+  done < <(service_plists)
+  return 1
+}
+
+service_schedule() {
+  local path="$1" iv ka cal
+  iv="$(/usr/libexec/PlistBuddy -c 'Print :StartInterval' "$path" 2>/dev/null)"
+  if [ -n "$iv" ]; then
+    if [ "$iv" -ge 3600 ] 2>/dev/null; then printf 'every %sh' "$((iv / 3600))"
+    elif [ "$iv" -ge 60 ] 2>/dev/null; then printf 'every %sm' "$((iv / 60))"
+    else printf 'every %ss' "$iv"; fi
+    return
+  fi
+  cal="$(/usr/libexec/PlistBuddy -c 'Print :StartCalendarInterval' "$path" 2>/dev/null)"
+  [ -n "$cal" ] && { printf 'scheduled'; return; }
+  ka="$(/usr/libexec/PlistBuddy -c 'Print :KeepAlive' "$path" 2>/dev/null)"
+  [ -n "$ka" ] && { printf 'keepalive'; return; }
+  printf 'on load'
+}
+
+service_log() {
+  local short="$1" f
+  for f in "$HOME/.config/$short.log" "$HOME/Library/Logs/$short.log"; do
+    [ -f "$f" ] && { printf '%s' "$f"; return 0; }
+  done
+  return 1
+}
+
+cmd_services() {
+  local sub="${1:-list}"; [ "$#" -ge 1 ] && shift
+  case "$sub" in
+    list|"")
+      printf '  %-24s %-12s %-11s %s\n' NAME STATUS SCHEDULE LAST
+      local lbl path short status pid sched logf last
+      while IFS='|' read -r lbl path; do
+        short="$(service_short "$lbl")"
+        pid="$(launchctl list 2>/dev/null | awk -v l="$lbl" '$3==l{print $1}')"
+        if [ -z "$pid" ]; then status="not loaded"
+        elif [ "$pid" = "-" ]; then status="idle"
+        else status="running"; fi
+        sched="$(service_schedule "$path")"
+        last=""
+        if logf="$(service_log "$short")"; then last="$(tail -1 "$logf" 2>/dev/null | cut -c1-46)"; fi
+        printf '  %-24s %-12s %-11s %s\n' "$short" "$status" "$sched" "$last"
+      done < <(service_plists)
+      ;;
+    start|load)
+      local entry; entry="$(service_resolve "${1:?usage: perch services start <name>}")" || { echo "perch: no such service '$1'" >&2; return 1; }
+      local lbl="${entry%%|*}" path="${entry#*|}"
+      launchctl bootstrap "gui/$(id -u)" "$path" 2>/dev/null || launchctl kickstart -k "gui/$(id -u)/$lbl" 2>/dev/null
+      echo "[perch] started $lbl" ;;
+    stop|unload)
+      local entry; entry="$(service_resolve "${1:?usage: perch services stop <name>}")" || { echo "perch: no such service '$1'" >&2; return 1; }
+      launchctl bootout "gui/$(id -u)/${entry%%|*}" 2>/dev/null
+      echo "[perch] stopped ${entry%%|*}" ;;
+    restart|kick)
+      local entry; entry="$(service_resolve "${1:?usage: perch services restart <name>}")" || { echo "perch: no such service '$1'" >&2; return 1; }
+      launchctl kickstart -k "gui/$(id -u)/${entry%%|*}" 2>/dev/null
+      echo "[perch] restarted ${entry%%|*}" ;;
+    log|logs)
+      local name="${1:?usage: perch services log <name> [lines]}"; local lines="${2:-30}"
+      local entry; entry="$(service_resolve "$name")" || { echo "perch: no such service '$name'" >&2; return 1; }
+      local short logf; short="$(service_short "${entry%%|*}")"
+      if logf="$(service_log "$short")"; then echo "[perch] $logf"; tail -n "$lines" "$logf"
+      else echo "[perch] $short keeps no log at ~/.config/$short.log"; fi ;;
+    *) echo "usage: perch services [list|start|stop|restart|log] [name]" >&2; return 1 ;;
+  esac
+}
+
 # Clear the visible text + scrollback of every Terminal tab (like Cmd+K), without
 # stopping anything. Writes the clear escape straight to each tab's tty, so it works
 # even in tabs running a live server (a plain `clear` can't — the shell isn't reading).
@@ -1571,7 +1667,7 @@ cmd_completion() {
     zsh) cat <<'ZSH'
 _perch() {
   local -a _c _p
-  _c=(start restart run stop clear cls open url list groups fav pick place autoplace set gui setup doctor completion port bounds add remove config killall tidy help)
+  _c=(start restart run stop clear cls open url list groups fav pick place autoplace set gui setup doctor completion port bounds add remove config killall tidy services help)
   _p=(${(f)"$(command perch _names 2>/dev/null)"})
   compadd -a _c; compadd -a _p
 }
@@ -1581,7 +1677,7 @@ ZSH
     bash) cat <<'BASH'
 _perch() {
   local cur="${COMP_WORDS[COMP_CWORD]}"
-  local words="start restart run stop clear cls open url list groups fav pick place autoplace set gui setup doctor completion port bounds add remove config killall tidy help $(command perch _names 2>/dev/null)"
+  local words="start restart run stop clear cls open url list groups fav pick place autoplace set gui setup doctor completion port bounds add remove config killall tidy services help $(command perch _names 2>/dev/null)"
   COMPREPLY=( $(compgen -W "$words" -- "$cur") )
 }
 complete -F _perch perch pz-dev
@@ -1609,14 +1705,25 @@ park_exclude_add() { mkdir -p "$(dirname "$PARK_EXCLUDE")"; touch "$PARK_EXCLUDE
 park_exclude_remove() { [ -f "$PARK_EXCLUDE" ] || return 0; grep -vxF "$1" "$PARK_EXCLUDE" > "$PARK_EXCLUDE.tmp" 2>/dev/null || true; mv "$PARK_EXCLUDE.tmp" "$PARK_EXCLUDE"; }
 place_apps() {
   yabai_available || return 0
-  local app spec sp wid n=0
-  while IFS='|' read -r app spec; do
+  local app spec size sp wid n=0 full=0
+  while IFS='|' read -r app spec size; do
     app="$(printf '%s' "$app" | sed 's/^ *//;s/ *$//')"; spec="$(printf '%s' "$spec" | tr -d ' ')"
+    size="$(printf '%s' "${size:-}" | tr -d ' ' | tr '[:upper:]' '[:lower:]')"
     [ -n "$app" ] && [ -n "$spec" ] || continue
     sp="$(resolve_space "$spec" || true)"; [ -n "$sp" ] || continue
+    case "$size" in full|fullscreen|fill) full=1 ;; *) full=0 ;; esac
     while IFS= read -r wid; do
       [ -n "$wid" ] || continue
+      # A native-fullscreen window owns its own space. Moving or re-gridding it fights
+      # macOS, which reports a space/display change, which re-fires autoplace, which
+      # moves it again -- a loop that yanks focus (and the pointer) every few seconds.
+      if [ "$(yabai -m query --windows --window "$wid" 2>/dev/null | sed -n 's/.*"is-native-fullscreen":\([a-z]*\).*/\1/p')" = "true" ]; then
+        continue
+      fi
       yabai -m window "$wid" --space "$sp" >/dev/null 2>&1 && n=$((n+1))
+      # grid 1:1:0:0:1:1 = one row, one column, so the window fills its whole space.
+      # Not native fullscreen: it keeps the menu bar and stays switchable.
+      [ "$full" = "1" ] && yabai -m window "$wid" --grid 1:1:0:0:1:1 >/dev/null 2>&1 || true
     done < <(yabai_app_windows "$app")
   done < <(apps_lines)
   [ "$n" -gt 0 ] && echo "[perch] placed $n app window(s)"
@@ -1628,15 +1735,16 @@ cmd_apps() {
     list|"")
       echo "[perch] pinned apps ($APPS):"
       if apps_lines | grep -q .; then
-        while IFS='|' read -r app spec; do
-          if park_excluded "$app"; then printf '  %-22s %-8s  park: off (stays put on disconnect)\n' "$app" "$spec"
-          else printf '  %-22s %-8s  park: on\n' "$app" "$spec"; fi
+        while IFS='|' read -r app spec size; do
+          local shown="$spec"; [ -n "${size:-}" ] && shown="$spec ($size)"
+          if park_excluded "$app"; then printf '  %-22s %-14s  park: off (stays put on disconnect)\n' "$app" "$shown"
+          else printf '  %-22s %-14s  park: on\n' "$app" "$shown"; fi
         done < <(apps_lines)
       else echo "  (none — add with: perch apps add \"Google Chrome\" 2:1)"; fi
       ;;
     --plain|plain)
-      while IFS='|' read -r app spec; do
-        printf '%s\t%s\t%s\n' "$app" "$spec" "$(park_excluded "$app" && echo off || echo on)"
+      while IFS='|' read -r app spec size; do
+        printf '%s\t%s\t%s\t%s\n' "$app" "$spec" "${size:-}" "$(park_excluded "$app" && echo off || echo on)"
       done < <(apps_lines) ;;
     park|nopark)
       local app="${1:?usage: perch apps park \"App Name\" on|off}"; local state="${2:-toggle}"
@@ -1649,12 +1757,15 @@ cmd_apps() {
         *) echo "usage: perch apps park \"App Name\" on|off" >&2; return 1 ;;
       esac ;;
     add|set)
-      local app="${1:?usage: perch apps add \"App Name\" <display:space>}"; local spec="${2:?usage: perch apps add \"App Name\" <display:space>}"
+      local app="${1:?usage: perch apps add \"App Name\" <display:space> [full]}"; local spec="${2:?usage: perch apps add \"App Name\" <display:space> [full]}"
       case "$spec" in *:*) ;; *) echo "perch: spec must be display:space, e.g. 2:1" >&2; return 1 ;; esac
+      local size=""
+      case "$(printf '%s' "${3:-}" | tr '[:upper:]' '[:lower:]')" in full|fullscreen|fill) size="full" ;; esac
       mkdir -p "$(dirname "$APPS")"; touch "$APPS"
       grep -vE "^${app}\\|" "$APPS" > "$APPS.tmp" 2>/dev/null || true; mv "$APPS.tmp" "$APPS"
-      printf '%s|%s\n' "$app" "$spec" >> "$APPS"
-      echo "[perch] pinned '$app' → $spec (run 'perch place' or it applies on next autoplace)"
+      if [ -n "$size" ]; then printf '%s|%s|%s\n' "$app" "$spec" "$size" >> "$APPS"
+      else printf '%s|%s\n' "$app" "$spec" >> "$APPS"; fi
+      echo "[perch] pinned '$app' → $spec${size:+ ($size)} (run 'perch place' or it applies on next autoplace)"
       ;;
     remove|rm|del)
       local app="${1:?usage: perch apps remove \"App Name\"}"
@@ -2201,7 +2312,8 @@ autoplace_count() {
   yabai -m signal --list 2>/dev/null | python3 -c 'import sys,json;print(len([s for s in json.load(sys.stdin) if "perch_autoplace" in (s.get("label") or "")]))' 2>/dev/null || echo 0
 }
 cmd_autoplace() {
-  local sub="${1:-status}"; [ "$#" -ge 1 ] && shift
+  if [ "$#" -eq 0 ]; then cmd_place category; cmd_autoplace status; return; fi
+  local sub="$1"; shift
   case "$sub" in
     _fire)   # debounced runner invoked by the yabai signals; coalesces bursts
       local lock=/tmp/perch-autoplace.lock
@@ -2437,11 +2549,12 @@ EOF
 perch autoplace — keep terminals arranged automatically (via yabai signals).
 
 USAGE
-  perch autoplace           show status (default)
+  perch autoplace           arrange now, then show status
   perch autoplace on        install signals: every new Terminal window or display change
-                            re-runs `perch place empty` (debounced). Persisted to ~/.yabairc.
+                            re-runs `perch place` (debounced). Persisted to ~/.yabairc.
   perch autoplace off       remove the signals + clean ~/.yabairc
-  perch autoplace now       run `perch place empty` once, right now
+  perch autoplace now       run `perch place` once, right now
+  perch autoplace status    show whether the signals are installed
 
 Needs yabai. `on` makes it survive a yabai restart; `off` fully disables it.
 EOF
@@ -2601,6 +2714,7 @@ main() {
     bounds|pos|position) shift; cmd_bounds "$@" ;;
     killall|kill-all|stopall) shift; cmd_killall "$@" ;;
     tidy|tidyup|closeidle) shift; cmd_tidy "$@" ;;
+    services|service|svc|agents) shift; cmd_services "$@" ;;
     clear|cls) cmd_clear ;;
     open) shift; cmd_open "${1:-}" ;;
     url|urls) shift; cmd_url "${1:-}" ;;

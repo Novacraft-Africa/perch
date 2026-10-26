@@ -49,7 +49,8 @@ def terminal_titles():
 
 # ---- config: category defaults + per-marker overrides ----
 overrides, defaults = {}, {}
-CATS = ("metro", "landing", "web", "admin", "backend", "other")
+CATS = ("metro", "landing", "web", "admin", "backend", "other", "devices")
+DEVICE_APPS = ("Simulator", "qemu-system-aarch64", "Android Emulator")
 try:
     for line in open(SPACES):
         line = line.strip()
@@ -136,9 +137,8 @@ for w in wins:
     if not title:
         continue
     marker = marker_of(title)
-    if not is_server(marker) and " - port:" not in title:
-        continue
-    cat = categorize(marker)
+    known = is_server(marker) or " - port:" in title
+    cat = categorize(marker) if known else "other"
     spec = overrides.get(marker) or defaults.get(cat)
     if not spec:
         continue
@@ -147,12 +147,21 @@ for w in wins:
         continue
     assign[sp].append((w, marker, cat))
 
-if not assign:
+dev_sp = resolve(defaults.get("devices") or "")
+fs_spaces = {s["index"] for s in spaces if s.get("is-native-fullscreen")}
+devices = [w for w in wins if w.get("app") in DEVICE_APPS
+           and w.get("space") not in fs_spaces and not w.get("is-minimized")] if dev_sp else []
+if devices:
+    label_of_sp.setdefault(dev_sp, "devices")
+
+if not assign and not devices:
     print("perch place category: no server terminals to place"); raise SystemExit(0)
 
 for sp in sorted(assign):
     items = assign[sp]
     print(f"  desktop space {sp} [{label_of_sp.get(sp, '?')}]: " + ", ".join(m for _, m, _ in items))
+if devices:
+    print(f"  desktop space {dev_sp} [devices]: " + ", ".join(w.get("title") or w["app"] for w in devices))
 
 if DRY:
     print("perch place category: DRY RUN — nothing moved")
@@ -167,14 +176,22 @@ for sp, items in assign.items():
                                capture_output=True, text=True)
             if r.returncode != 0:
                 fails += 1
+for w in devices:
+    if w["space"] != dev_sp:
+        if subprocess.run(["yabai", "-m", "window", str(w["id"]), "--space", str(dev_sp)],
+                          capture_output=True).returncode != 0:
+            fails += 1
 
-# self-heal: stale yabai tracking silently drops moves. Restart yabai once and re-exec
-# a fresh pass. Guards: PERCH_PLACE_HEALED (no 2nd heal in the retried run) + a 90s lock
-# (a yabai restart itself fires display_changed → autoplace, so bound the restart rate).
+# self-heal: stale yabai tracking silently drops moves and resizes, even when nothing
+# needs moving. Restart yabai once and re-exec a fresh pass. Guards: PERCH_PLACE_HEALED
+# (no 2nd heal in the retried run) + a 90s lock (a yabai restart itself fires
+# display_changed → autoplace, so bound the restart rate).
 HEAL_LOCK = "/tmp/perch-place-heal.lock"
-recent = os.path.exists(HEAL_LOCK) and (time.time() - os.path.getmtime(HEAL_LOCK) < 90)
-if fails and "PERCH_PLACE_HEALED" not in os.environ and not recent:
-    print(f"perch place category: {fails} move(s) failed (stale yabai tracking) — restarting yabai + retrying")
+def heal(fails, what):
+    recent = os.path.exists(HEAL_LOCK) and (time.time() - os.path.getmtime(HEAL_LOCK) < 90)
+    if not fails or "PERCH_PLACE_HEALED" in os.environ or recent:
+        return
+    print(f"perch place category: {fails} {what}(s) failed (stale yabai tracking) — restarting yabai + retrying")
     open(HEAL_LOCK, "w").close()
     subprocess.run(["yabai", "--restart-service"], capture_output=True)
     for _ in range(6):
@@ -183,24 +200,92 @@ if fails and "PERCH_PLACE_HEALED" not in os.environ and not recent:
             break
     os.execve(sys.executable, [sys.executable] + sys.argv, dict(os.environ, PERCH_PLACE_HEALED="1"))
 
+heal(fails, "move")
+
 # tile each desktop full-width, stacked. Re-query the ACTUAL windows now on each target
 # space — tiling the pre-move `assign` (a window that failed to move, or a stale count)
 # is what left gaps/overlaps = "not filling". Sizing from reality fills the desktop.
 if not NOTILE:
     TOP, GAP = 32, 8
+    MAX_DEVICE_OVERLAP = 0.35
+    DEVICE_GAP = 4
     fresh = q("--windows")
-    targets = set(assign)
+    targets = set(assign) | ({dev_sp} if devices else set())
     persp = collections.defaultdict(list)
+    devsp = collections.defaultdict(list)
+    tile_fails = 0
     for w in fresh:
-        if w.get("app") == "Terminal" and w.get("space") in targets:
+        if w.get("space") not in targets:
+            continue
+        if w.get("app") == "Terminal":
             persp[w["space"]].append(w)
+        elif w.get("app") in DEVICE_APPS and not w.get("is-minimized") and w["frame"]["h"] >= 100:
+            devsp[w["space"]].append(w)
+
+    def place(wid, op, arg):
+        global tile_fails
+        if subprocess.run(["yabai", "-m", "window", str(wid), op, arg],
+                          capture_output=True).returncode != 0:
+            tile_fails += 1
+
+    # An Android emulator is a main window plus a separate toolbar window from the same
+    # process; they move as one unit so the toolbar stays beside its emulator.
+    def device_units(devs):
+        grouped = collections.defaultdict(list)
+        for w in devs:
+            key = (w["app"], w["id"]) if w["app"] == "Simulator" else (w["app"], w.get("pid"))
+            grouped[key].append(w)
+        units = [sorted(members, key=lambda m: -m["frame"]["w"] * m["frame"]["h"]) for members in grouped.values()]
+        return sorted(units, key=lambda unit: (unit[0]["app"] != "Simulator", unit[0]["id"]))
+
+    def unit_width(unit):
+        return sum(m["frame"]["w"] for m in unit) + DEVICE_GAP * (len(unit) - 1)
+
+    reserved = {}
+    for sp, devs in devsp.items():
+        f = frame_by_disp[disp_by_space[sp]]
+        FX, FY, FW, FH = f["x"], f["y"], f["w"], f["h"]
+        units = device_units(devs)
+        usable = FW - 2 * DEVICE_GAP
+        total = sum(unit_width(unit) for unit in units) + DEVICE_GAP * (len(units) - 1)
+        overflow = total - usable
+        smallest = min(unit_width(unit) for unit in units)
+        if overflow <= 0 or (len(units) > 1 and overflow <= MAX_DEVICE_OVERLAP * smallest):
+            rows = [units]
+            step_cut = max(0, overflow) / max(1, len(units) - 1)
+        else:
+            rows, row, width = [], [], 0
+            for unit in units:
+                uw = unit_width(unit)
+                if row and width + DEVICE_GAP + uw > usable:
+                    rows.append(row); row, width = [], 0
+                row.append(unit); width += (DEVICE_GAP if width else 0) + uw
+            if row:
+                rows.append(row)
+            step_cut = 0
+        bottom = FY + FH - DEVICE_GAP
+        for row in rows:
+            rh = max(m["frame"]["h"] for unit in row for m in unit)
+            x = FX + DEVICE_GAP
+            for unit in row:
+                unit_top = bottom - unit[0]["frame"]["h"]
+                for m in unit:
+                    place(m["id"], "--move", f"abs:{int(x)}:{int(unit_top)}")
+                    x += m["frame"]["w"] + DEVICE_GAP
+                x -= step_cut
+            bottom -= rh + DEVICE_GAP
+        reserved[sp] = FY + FH - DEVICE_GAP - bottom
+
     for sp, items in sorted(persp.items()):
         f = frame_by_disp[disp_by_space[sp]]
         FX, FY, FW, FH = f["x"], f["y"], f["w"], f["h"]
+        FH -= reserved.get(sp, 0)
         n = len(items); ah = (FH - TOP - GAP) / n
         for i, w in enumerate(sorted(items, key=lambda x: x["id"])):
-            y("window", str(w["id"]), "--move", f"abs:{int(FX+GAP)}:{int(FY+TOP+i*ah)}")
-            y("window", str(w["id"]), "--resize", f"abs:{int(FW-2*GAP)}:{int(ah-GAP)}")
+            place(w["id"], "--move", f"abs:{int(FX+GAP)}:{int(FY+TOP+i*ah)}")
+            place(w["id"], "--resize", f"abs:{int(FW-2*GAP)}:{int(ah-GAP)}")
+    heal(tile_fails, "tile")
 
 total = sum(len(v) for v in assign.values())
-print(f"perch place category: grouped {total} terminals by type across {len(assign)} desktop(s)")
+print(f"perch place category: grouped {total} terminals by type across {len(assign)} desktop(s)"
+      + (f", {len(devices)} simulator/emulator window(s) on space {dev_sp}" if devices else ""))
